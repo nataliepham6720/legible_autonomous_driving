@@ -10,6 +10,7 @@ import transformers
 from peft import get_peft_model_state_dict  # noqa: E402
 from transformers import logging  # noqa: F402
 
+
 import wandb
 from utils.model_utils import load_llama_tokenizer, load_model
 from utils.training_utils import (
@@ -22,6 +23,7 @@ from utils.training_utils import (
     log_txt_as_img,
 )
 
+# os.environ["WANDB_LOG_MODEL"] = "end" 
 
 class TrainerWithGeneration(transformers.Seq2SeqTrainer):
     """
@@ -143,7 +145,7 @@ def train(
     wandb_project: str = "llm-driver",
     wandb_run_name: str = "",
     wandb_watch: str = "false",  # options: false | gradients | all
-    wandb_log_model: str = "true",  # options: false | true
+    wandb_log_model: str = "checkpoint",  # options: "end" | "checkpoint"
     resume_from_checkpoint: str = "models/weights/stage1_pretrained_model/",  # always resume from pre-finetuned model
     augment_times: int = 0,
     output_dir: Optional[str] = None,
@@ -215,6 +217,7 @@ def train(
         resume_from_checkpoint=resume_from_checkpoint,
     )
 
+    model.to("cuda:0")
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
     # Load tokenizer
@@ -247,7 +250,7 @@ def train(
             fp16=True,
             logging_steps=2,
             optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            eval_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
             eval_steps=eval_steps if val_set_size > 0 else None,
             save_steps=200,

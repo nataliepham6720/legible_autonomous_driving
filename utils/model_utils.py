@@ -7,6 +7,33 @@ from transformers import GenerationConfig, LlamaTokenizer
 
 from models.vector_lm import LlamaForCausalLMVectorInput, VectorLMWithLoRA
 
+# class LoraConfigVectorLM(LoraConfig):
+#     def __post_init__(self):
+#         # Force PEFT to initialize all internal fields
+#         super().__post_init__()
+
+#         # Override task_type AFTER initialization
+#         self.task_type = "Vector_LM"
+
+#         # Ensure PEFT-required fields exist (defensive)
+#         if not hasattr(self, "_custom_modules"):
+#             self._custom_modules = None
+
+#         if not hasattr(self, "peft_type") or self.peft_type is None:
+#             self.peft_type = "LORA"
+class LoraConfigVectorLM(LoraConfig):
+    def __post_init__(self):
+        # force peft_type to LORA
+        # kwargs["peft_type"] = "LORA"
+        object.__setattr__(self, "task_type", "Vector_LM")
+        # initialize internal fields expected by PEFT
+        object.__setattr__(self, "_custom_modules", [])
+        object.__setattr__(self, "_default_modules", [])
+        object.__setattr__(self, "_init_modules", [])
+
+        # allow any task_type
+        if not hasattr(self, "task_type"):
+            self.task_type = "Vector_LM"  # default fallback
 
 def load_llama_tokenizer(base_model):
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
@@ -63,13 +90,14 @@ def load_model(
         torch_dtype=torch.float16,
         device_map=device_map,
     )
-    lora_config = LoraConfig(
+    lora_config = LoraConfigVectorLM(
         r=lora_r,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
         lora_dropout=lora_dropout,
         bias="none",
         task_type="Vector_LM",
+        peft_type="LORA", 
     )
     if load_in_8bit:
         llama_model = prepare_model_for_kbit_training(llama_model)

@@ -161,7 +161,7 @@ class VectorLMWithLoRA(PeftModelForCausalLM):
             self.vector_encoder.out_features, self.config.hidden_size
         )
         self.to(model.device)
-        self.modules_to_save = ["vector_encoder", "llm_proj"]
+        self._modules_to_save = ["vector_encoder", "llm_proj"]
         self.generation_config = GenerationConfig(
             temperature=0.1,
             top_p=0.75,
