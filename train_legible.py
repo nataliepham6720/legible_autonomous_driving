@@ -3,6 +3,7 @@ import datetime
 import tempfile
 from typing import Tuple
 
+import os
 import fire
 import numpy as np
 import torch
@@ -218,61 +219,160 @@ def patch_vector_fields(dataset):
 # ============================================================
 # LEGIBILITY LOSS (DRAGAN)
 # ============================================================
+def compute_dragan_legibility_loss(model, inputs, alpha: float = 1.0):
+    """
+    Multi-observer, distance-weighted legibility loss (Dragan-style).
 
-def compute_dragan_legibility_loss(model, inputs):
+    Observers = vehicles + pedestrians.
+    Closer observers get higher weight.
+    True goal is assumed to be route index 0.
+    """
+
     labels = inputs["labels"]
-    routes = inputs["route_descriptors"]
+    routes = inputs["route_descriptors"]           # [B, 30, 17]
+    vehicle = inputs["vehicle_descriptors"]       # [B, 30, 33]
+    pedestrian = inputs["pedestrian_descriptors"] # [B, 20, 9]
+    ego = inputs["ego_vehicle_descriptor"]        # [B, 31]
 
-    vehicle = inputs["vehicle_descriptors"]
-    pedestrian = inputs["pedestrian_descriptors"]
-    ego = inputs["ego_vehicle_descriptor"]
+    B, K, _ = routes.shape  # K = 30 route candidates
 
-    B, K, _ = routes.shape
-    log_likelihoods = []
+    print("object shape", routes.shape, vehicle.shape, pedestrian.shape, ego.shape)
+    print(vehicle[0,:,:])
+    print(pedestrian[0,:,:])
+    # --------------------------------------------------
+    # 1) BUILD OBSERVER SET (POSITION ONLY)
+    # --------------------------------------------------
+    # Take only (x, y) positions for distance computation
+    veh_xy = vehicle[:, :, :2]       # [B, 30, 2]
+    ped_xy = pedestrian[:, :, :2]    # [B, 20, 2]
 
-    for g in range(K):
-        goal_route = routes.clone()
-        goal_route[:, :, :] = 0
-        goal_route[:, 0] = routes[:, g]  # isolate goal
+    # Concatenate observers in a common space
+    obs_xy = torch.cat([veh_xy, ped_xy], dim=1)  # [B, 50, 2]
+    N_obs = obs_xy.shape[1]  # total observers = 50
 
-        with torch.no_grad():
-            out = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                labels=labels,
-                route_descriptors=goal_route,
-                vehicle_descriptors=vehicle,
-                pedestrian_descriptors=pedestrian,
-                ego_vehicle_descriptor=ego,
-            )
+    # --------------------------------------------------
+    # 2) DISTANCE-BASED OBSERVER WEIGHTS
+    # --------------------------------------------------
+    ego_xy = ego[:, :2]  # [B, 2]
 
-        # logits = out.logits[:, -labels.size(1):]
-        # print("out", out)
-        # with torch.no_grad():
-        #     out = model(
-        #         input_ids=inputs["input_ids"],
-        #         attention_mask=inputs["attention_mask"],
-        #         labels=labels,
-        #         route_descriptors=goal_route,
-        #         vehicle_descriptors=vehicle,
-        #         pedestrian_descriptors=pedestrian,
-        #         ego_vehicle_descriptor=ego,
-        #     )
+    # Pairwise distances: [B, N_obs]
+    dists = torch.norm(obs_xy - ego_xy.unsqueeze(1), dim=-1)
 
-        logits = out["loss"]#[:, -labels.size(1):]
-        # log_probs = F.log_softmax(logits, dim=-1)
+    # Soft weighting: nearer observers get higher weight
+    obs_weights = torch.softmax(-alpha * dists, dim=1)  # [B, N_obs]
 
-        log_probs = F.log_softmax(logits, dim=-1)
+    # --------------------------------------------------
+    # 3) PER-OBSERVER LEGIBILITY
+    # --------------------------------------------------
+    all_obs_leg_losses = []
 
-        # token_logp = torch.gather(log_probs, 2, labels.unsqueeze(-1)).squeeze(-1)
-        # traj_logp = token_logp.mean(dim=1)
+    for o in range(N_obs):
 
-        log_likelihoods.append(log_probs)
+        log_likelihoods = []
 
-    log_likelihoods = torch.stack(log_likelihoods)#, dim=1)
-    posterior = F.log_softmax(log_likelihoods)#, dim=1)
+        for g in range(K):
+            # Isolate candidate goal g
+            goal_route = routes.clone()
+            goal_route.zero_()
+            goal_route[:, 0, :] = routes[:, g, :]  # put goal in slot 0
 
-    return -1 #posterior.mean() # [:, 0].mean()
+            with torch.no_grad():
+                out = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    labels=labels,
+                    route_descriptors=goal_route,
+                    vehicle_descriptors=vehicle,
+                    pedestrian_descriptors=pedestrian,
+                    ego_vehicle_descriptor=ego,
+                )
+
+            # Use negative sequence loss as proxy for goal likelihood
+            ll = -out["loss"]  # scalar per batch item
+            log_likelihoods.append(ll)
+
+        # Stack across goals → shape [K, B]
+        log_likelihoods = torch.stack(log_likelihoods, dim=0)
+
+        # Posterior over goals (for this observer)
+        goal_posterior = F.log_softmax(log_likelihoods, dim=0)  # over K
+
+        # True goal = route index 0
+        true_goal_logp = goal_posterior[0]  # [B]
+
+        # Legibility loss for this observer (scalar)
+        obs_leg_loss = -true_goal_logp.mean()
+        all_obs_leg_losses.append(obs_leg_loss)
+
+    # --------------------------------------------------
+    # 4) WEIGHT AND SUM ACROSS OBSERVERS
+    # --------------------------------------------------
+    all_obs_leg_losses = torch.stack(all_obs_leg_losses)  # [N_obs]
+
+    # Average weights over batch to align dimensions
+    w = obs_weights.mean(dim=0)  # [N_obs]
+
+    total_leg_loss = (w * all_obs_leg_losses).sum()
+
+    return total_leg_loss
+
+
+
+
+# def compute_dragan_legibility_loss(model, inputs):
+#     labels = inputs["labels"]
+#     routes = inputs["route_descriptors"]
+
+#     vehicle = inputs["vehicle_descriptors"]
+#     pedestrian = inputs["pedestrian_descriptors"]
+#     ego = inputs["ego_vehicle_descriptor"]
+
+#     B, K, _ = routes.shape
+#     log_likelihoods = []
+
+#     for g in range(K):
+#         goal_route = routes.clone()
+#         goal_route[:, :, :] = 0
+#         goal_route[:, 0] = routes[:, g]  # isolate goal
+
+#         with torch.no_grad():
+#             out = model(
+#                 input_ids=inputs["input_ids"],
+#                 attention_mask=inputs["attention_mask"],
+#                 labels=labels,
+#                 route_descriptors=goal_route,
+#                 vehicle_descriptors=vehicle,
+#                 pedestrian_descriptors=pedestrian,
+#                 ego_vehicle_descriptor=ego,
+#             )
+
+#         # logits = out.logits[:, -labels.size(1):]
+#         # print("out", out)
+#         # with torch.no_grad():
+#         #     out = model(
+#         #         input_ids=inputs["input_ids"],
+#         #         attention_mask=inputs["attention_mask"],
+#         #         labels=labels,
+#         #         route_descriptors=goal_route,
+#         #         vehicle_descriptors=vehicle,
+#         #         pedestrian_descriptors=pedestrian,
+#         #         ego_vehicle_descriptor=ego,
+#         #     )
+
+#         logits = out["loss"]#[:, -labels.size(1):]
+#         # log_probs = F.log_softmax(logits, dim=-1)
+
+#         log_probs = F.log_softmax(logits, dim=-1)
+
+#         # token_logp = torch.gather(log_probs, 2, labels.unsqueeze(-1)).squeeze(-1)
+#         # traj_logp = token_logp.mean(dim=1)
+
+#         log_likelihoods.append(log_probs)
+
+#     log_likelihoods = torch.stack(log_likelihoods)#, dim=1)
+#     posterior = F.log_softmax(log_likelihoods)#, dim=1)
+
+#     return -1 #posterior.mean() # [:, 0].mean()
 
 
 # ============================================================
@@ -328,38 +428,132 @@ class TrainerWithGeneration(transformers.Seq2SeqTrainer):
 # TRAIN ENTRYPOINT
 # ============================================================
 
+# def train(
+#     base_model="meta-llama/Llama-2-7b-hf",
+#     data_path="data/vqa_test_200.pkl",
+#     batch_size=128,
+#     micro_batch_size=32,
+#     num_epochs=1,
+#     learning_rate=3e-4,
+#     val_set_size=100,
+#     eval_steps=10,
+#     lora_r=16,
+#     resume_from_checkpoint="models/weights/stage1_pretrained_model/",
+#     legibility_weight=0.5,
+# ):
+
+#     output_dir = tempfile.mkdtemp(prefix=f"legible_safe_{datetime.datetime.now():%Y%m%d_%H%M%S}_")
+
+#     base_model_token = base_model
+#     base_model = load_model(
+#         base_model=base_model_token,
+#         resume_from_checkpoint=resume_from_checkpoint,
+#         lora_r=16
+#     ).cuda()
+
+#     model = VectorRouteGuard(base_model).cuda()
+
+#     tokenizer = load_llama_tokenizer(base_model_token)
+
+#     train_data, val_data = get_train_val_data(data_path, tokenizer, val_set_size=val_set_size)
+
+#     train_data = patch_vector_fields(train_data)
+#     val_data = patch_vector_fields(val_data)
+
+#     trainer = TrainerWithGeneration(
+#         model=model,
+#         train_dataset=train_data,
+#         eval_dataset=val_data,
+#         legibility_weight=legibility_weight,
+#         args=transformers.Seq2SeqTrainingArguments(
+#             per_device_train_batch_size=micro_batch_size,
+#             gradient_accumulation_steps=batch_size // micro_batch_size,
+#             num_train_epochs=num_epochs,
+#             learning_rate=learning_rate,
+#             fp16=True,
+#             logging_steps=10,
+#             eval_steps=eval_steps,
+#             save_steps=500,
+#             output_dir=output_dir,
+#             save_total_limit=3,
+#             predict_with_generate=True,
+#             generation_max_length=384,
+#             report_to=None,
+#         ),
+#         data_collator=transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, padding=True),
+#     )
+
+#     logging.set_verbosity_info()
+
+#     trainer.train()
+#     model.save_pretrained(output_dir)
+
+#     print("Training complete →", output_dir)
+
 def train(
     base_model="meta-llama/Llama-2-7b-hf",
-    data_path="data/vqa_test_1k.pkl",
+    data_path="data/vqa_test_200.pkl",
     batch_size=128,
     micro_batch_size=32,
-    num_epochs=5,
+    num_epochs=1,
     learning_rate=3e-4,
     val_set_size=100,
-    eval_steps=50,
+    eval_steps=10,
     lora_r=16,
     resume_from_checkpoint="models/weights/stage1_pretrained_model/",
-    legibility_weight=0.3,
+    legibility_weight=0.5,
+    wandb_project: str = "legible_driving",
+    wandb_run_name: str = "test_run",
 ):
 
-    output_dir = tempfile.mkdtemp(prefix=f"legible_safe_{datetime.datetime.now():%Y%m%d_%H%M%S}_")
+    # ------------------------------
+    # 1) SET UP WANDB
+    # ------------------------------
+    os.environ["WANDB_PROJECT"] = wandb_project
+    if wandb_run_name:
+        os.environ["WANDB_RUN_NAME"] = wandb_run_name
+
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name if wandb_run_name else None,
+        config={
+            "base_model": base_model,
+            "batch_size": batch_size,
+            "micro_batch_size": micro_batch_size,
+            "num_epochs": num_epochs,
+            "learning_rate": learning_rate,
+            "legibility_weight": legibility_weight,
+        },
+    )
+
+    # ------------------------------
+    # 2) MODEL & DATA
+    # ------------------------------
+    output_dir = tempfile.mkdtemp(
+        prefix=f"legible_safe_{datetime.datetime.now():%Y%m%d_%H%M%S}_"
+    )
 
     base_model_token = base_model
     base_model = load_model(
         base_model=base_model_token,
         resume_from_checkpoint=resume_from_checkpoint,
-        lora_r=16
+        lora_r=16,
     ).cuda()
 
     model = VectorRouteGuard(base_model).cuda()
 
     tokenizer = load_llama_tokenizer(base_model_token)
 
-    train_data, val_data = get_train_val_data(data_path, tokenizer, val_set_size=val_set_size)
+    train_data, val_data = get_train_val_data(
+        data_path, tokenizer, val_set_size=val_set_size
+    )
 
     train_data = patch_vector_fields(train_data)
     val_data = patch_vector_fields(val_data)
 
+    # ------------------------------
+    # 3) TRAINER WITH WANDB LOGGING
+    # ------------------------------
     trainer = TrainerWithGeneration(
         model=model,
         train_dataset=train_data,
@@ -378,17 +572,51 @@ def train(
             save_total_limit=3,
             predict_with_generate=True,
             generation_max_length=384,
-            report_to=None,
+            report_to="wandb",              # <-- KEY LINE
+            run_name=wandb_run_name,        # <-- KEY LINE
         ),
-        data_collator=transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, padding=True),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, padding=True
+        ),
     )
 
-    logging.set_verbosity_info()
+    # ------------------------------
+    # 4) PATCH TRAINER TO LOG LEGIBILITY LOSS
+    # ------------------------------
+    original_compute_loss = trainer.compute_loss
 
+    def compute_loss_with_legibility_logging(model, inputs, *args, **kwargs):
+        loss = original_compute_loss(model, inputs, *args, **kwargs)
+
+        # If loss is a tuple (loss, outputs), extract loss
+        if isinstance(loss, tuple):
+            total_loss = loss[0]
+        else:
+            total_loss = loss
+
+        # Try to access last computed legibility loss if stored in trainer
+        if hasattr(trainer, "last_leg_loss"):
+            wandb.log(
+                {
+                    "train/total_loss": total_loss.item(),
+                    "train/legibility_loss": trainer.last_leg_loss,
+                    "train/lm_loss": trainer.last_lm_loss,
+                }
+            )
+
+        return loss
+
+    trainer.compute_loss = compute_loss_with_legibility_logging
+
+    # ------------------------------
+    # 5) TRAIN
+    # ------------------------------
+    logging.set_verbosity_info()
     trainer.train()
     model.save_pretrained(output_dir)
 
     print("Training complete →", output_dir)
+
 
 if __name__ == "__main__":
     fire.Fire(train)
