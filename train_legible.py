@@ -221,11 +221,13 @@ def patch_vector_fields(dataset):
 # ============================================================
 def compute_dragan_legibility_loss(model, inputs, alpha: float = 1.0):
     """
-    Multi-observer, distance-weighted legibility loss (Dragan-style).
+    Multi-observer, distance-weighted legibility loss (Dragan-style),
+    now CORRECTLY handling empty (all-zero) objects.
 
-    Observers = vehicles + pedestrians.
-    Closer observers get higher weight.
-    True goal is assumed to be route index 0.
+    - Observers = vehicles + pedestrians.
+    - Closer observers get higher weight.
+    - True goal is assumed to be route index 0.
+    - Empty rows (flag=0) are ignored.
     """
 
     labels = inputs["labels"]
@@ -236,37 +238,56 @@ def compute_dragan_legibility_loss(model, inputs, alpha: float = 1.0):
 
     B, K, _ = routes.shape  # K = 30 route candidates
 
-    print("object shape", routes.shape, vehicle.shape, pedestrian.shape, ego.shape)
-    print(vehicle[0,:,:])
-    print(pedestrian[0,:,:])
     # --------------------------------------------------
-    # 1) BUILD OBSERVER SET (POSITION ONLY)
+    # 1) BUILD OBSERVER SET (POSITION ONLY + EXISTENCE MASK)
     # --------------------------------------------------
-    # Take only (x, y) positions for distance computation
-    veh_xy = vehicle[:, :, :2]       # [B, 30, 2]
-    ped_xy = pedestrian[:, :, :2]    # [B, 20, 2]
 
-    # Concatenate observers in a common space
+    # Existence flag is FIRST COLUMN in both vehicle & pedestrian
+    veh_exists = vehicle[:, :, 0] > 0        # [B, 30]
+    ped_exists = pedestrian[:, :, 0] > 0     # [B, 20]
+
+    # Extract (x, y) positions ONLY for existing objects
+    # (your schema says relative position is in early dims)
+    veh_xy = vehicle[:, :, 3:5]              # [B, 30, 2]  (relative x,y)
+    ped_xy = pedestrian[:, :, 2:4]           # [B, 20, 2]  (relative x,y)
+
+    # Mask out empty rows
+    veh_xy = veh_xy * veh_exists.unsqueeze(-1)   # zero out non-existing vehicles
+    ped_xy = ped_xy * ped_exists.unsqueeze(-1)   # zero out non-existing pedestrians
+
+    # Concatenate observers
     obs_xy = torch.cat([veh_xy, ped_xy], dim=1)  # [B, 50, 2]
-    N_obs = obs_xy.shape[1]  # total observers = 50
+    obs_exists = torch.cat([veh_exists, ped_exists], dim=1)  # [B, 50]
+
+    # If there are NO observers in the entire batch, return zero loss
+    if obs_exists.sum() == 0:
+        return torch.tensor(0.0, device=routes.device)
 
     # --------------------------------------------------
-    # 2) DISTANCE-BASED OBSERVER WEIGHTS
+    # 2) DISTANCE-BASED OBSERVER WEIGHTS (MASKED)
     # --------------------------------------------------
     ego_xy = ego[:, :2]  # [B, 2]
 
-    # Pairwise distances: [B, N_obs]
+    # Pairwise distances: [B, 50]
     dists = torch.norm(obs_xy - ego_xy.unsqueeze(1), dim=-1)
 
+    # Large distance for non-existing objects so they get ~zero weight
+    dists = dists + (1 - obs_exists.float()) * 1e6
+
     # Soft weighting: nearer observers get higher weight
-    obs_weights = torch.softmax(-alpha * dists, dim=1)  # [B, N_obs]
+    obs_weights = torch.softmax(-alpha * dists, dim=1)  # [B, 50]
 
     # --------------------------------------------------
     # 3) PER-OBSERVER LEGIBILITY
     # --------------------------------------------------
     all_obs_leg_losses = []
 
-    for o in range(N_obs):
+    for o in range(obs_xy.shape[1]):
+
+        # Skip non-existing observers entirely
+        if obs_exists[:, o].sum() == 0:
+            all_obs_leg_losses.append(torch.tensor(0.0, device=routes.device))
+            continue
 
         log_likelihoods = []
 
@@ -307,14 +328,113 @@ def compute_dragan_legibility_loss(model, inputs, alpha: float = 1.0):
     # --------------------------------------------------
     # 4) WEIGHT AND SUM ACROSS OBSERVERS
     # --------------------------------------------------
-    all_obs_leg_losses = torch.stack(all_obs_leg_losses)  # [N_obs]
+    all_obs_leg_losses = torch.stack(all_obs_leg_losses)  # [50]
 
     # Average weights over batch to align dimensions
-    w = obs_weights.mean(dim=0)  # [N_obs]
+    w = obs_weights.mean(dim=0)  # [50]
 
     total_leg_loss = (w * all_obs_leg_losses).sum()
 
     return total_leg_loss
+
+
+
+# def compute_dragan_legibility_loss(model, inputs, alpha: float = 1.0):
+#     """
+#     Multi-observer, distance-weighted legibility loss (Dragan-style).
+
+#     Observers = vehicles + pedestrians.
+#     Closer observers get higher weight.
+#     True goal is assumed to be route index 0.
+#     """
+
+#     labels = inputs["labels"]
+#     routes = inputs["route_descriptors"]           # [B, 30, 17]
+#     vehicle = inputs["vehicle_descriptors"]       # [B, 30, 33]
+#     pedestrian = inputs["pedestrian_descriptors"] # [B, 20, 9]
+#     ego = inputs["ego_vehicle_descriptor"]        # [B, 31]
+
+#     B, K, _ = routes.shape  # K = 30 route candidates
+
+#     print("object shape", routes.shape, vehicle.shape, pedestrian.shape, ego.shape)
+#     print(vehicle[0,:,:])
+#     print(pedestrian[0,:,:])
+#     # --------------------------------------------------
+#     # 1) BUILD OBSERVER SET (POSITION ONLY)
+#     # --------------------------------------------------
+#     # Take only (x, y) positions for distance computation
+#     veh_xy = vehicle[:, :, :2]       # [B, 30, 2]
+#     ped_xy = pedestrian[:, :, :2]    # [B, 20, 2]
+
+#     # Concatenate observers in a common space
+#     obs_xy = torch.cat([veh_xy, ped_xy], dim=1)  # [B, 50, 2]
+#     N_obs = obs_xy.shape[1]  # total observers = 50
+
+#     # --------------------------------------------------
+#     # 2) DISTANCE-BASED OBSERVER WEIGHTS
+#     # --------------------------------------------------
+#     ego_xy = ego[:, :2]  # [B, 2]
+
+#     # Pairwise distances: [B, N_obs]
+#     dists = torch.norm(obs_xy - ego_xy.unsqueeze(1), dim=-1)
+
+#     # Soft weighting: nearer observers get higher weight
+#     obs_weights = torch.softmax(-alpha * dists, dim=1)  # [B, N_obs]
+
+#     # --------------------------------------------------
+#     # 3) PER-OBSERVER LEGIBILITY
+#     # --------------------------------------------------
+#     all_obs_leg_losses = []
+
+#     for o in range(N_obs):
+
+#         log_likelihoods = []
+
+#         for g in range(K):
+#             # Isolate candidate goal g
+#             goal_route = routes.clone()
+#             goal_route.zero_()
+#             goal_route[:, 0, :] = routes[:, g, :]  # put goal in slot 0
+
+#             with torch.no_grad():
+#                 out = model(
+#                     input_ids=inputs["input_ids"],
+#                     attention_mask=inputs["attention_mask"],
+#                     labels=labels,
+#                     route_descriptors=goal_route,
+#                     vehicle_descriptors=vehicle,
+#                     pedestrian_descriptors=pedestrian,
+#                     ego_vehicle_descriptor=ego,
+#                 )
+
+#             # Use negative sequence loss as proxy for goal likelihood
+#             ll = -out["loss"]  # scalar per batch item
+#             log_likelihoods.append(ll)
+
+#         # Stack across goals → shape [K, B]
+#         log_likelihoods = torch.stack(log_likelihoods, dim=0)
+
+#         # Posterior over goals (for this observer)
+#         goal_posterior = F.log_softmax(log_likelihoods, dim=0)  # over K
+
+#         # True goal = route index 0
+#         true_goal_logp = goal_posterior[0]  # [B]
+
+#         # Legibility loss for this observer (scalar)
+#         obs_leg_loss = -true_goal_logp.mean()
+#         all_obs_leg_losses.append(obs_leg_loss)
+
+#     # --------------------------------------------------
+#     # 4) WEIGHT AND SUM ACROSS OBSERVERS
+#     # --------------------------------------------------
+#     all_obs_leg_losses = torch.stack(all_obs_leg_losses)  # [N_obs]
+
+#     # Average weights over batch to align dimensions
+#     w = obs_weights.mean(dim=0)  # [N_obs]
+
+#     total_leg_loss = (w * all_obs_leg_losses).sum()
+
+#     return total_leg_loss
 
 
 
