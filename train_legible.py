@@ -372,7 +372,7 @@ def train(
     micro_batch_size=32,
     num_epochs=5,
     learning_rate=3e-4,
-    val_set_size=100,
+    val_set_size=200,
     eval_steps=10,
     lora_r=16,
     resume_from_checkpoint="models/weights/stage1_pretrained_model/",
@@ -489,7 +489,10 @@ def train(
     logging.set_verbosity_info()
     trainer.train()
     # model.save_pretrained(output_dir)
+    output_dir = '/content/legible_autonomous_driving/results/legible_finetune'
     trainer.save_model(output_dir)
+    torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+    tokenizer.save_pretrained(output_dir)
 
     print("Training complete →", output_dir)
 
