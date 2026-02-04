@@ -365,7 +365,7 @@ def train(
     data_path="data/vqa_test_600.pkl",
     batch_size=128,
     micro_batch_size=32,
-    num_epochs=5,
+    num_epochs=3,
     learning_rate=3e-4,
     val_set_size=200,
     eval_steps=10,
