@@ -1,15 +1,14 @@
 # =============================================================
-# eval_legible.py
-# Observer-Aware Legibility Evaluation (RO-MAN 2022)
-# Goal assumed to be straight ahead; crossing-aware pedestrians
+# eval.py
+# Unified Evaluation Script (Batch + Modular + WandB)
 # =============================================================
 
 import argparse
 import os
-import json
 import math
 import torch
 import numpy as np
+import wandb
 from transformers import AutoModelForCausalLM
 from safetensors.torch import load_file
 
@@ -18,316 +17,204 @@ from utils.training_utils import get_train_val_data
 from train_legible import VectorRouteGuard, patch_vector_fields
 
 # =============================================================
-# REPRODUCIBILITY
+# CONFIG
 # =============================================================
 
-def set_global_seed(seed: int = 42):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+BETA = 0.5
+FOV_DEG = 120.0
+CROSSING_BOOST = 1.5
 
 # =============================================================
-# UTILITIES
+# UTILS
 # =============================================================
-
-def to_tensor(x, device):
-    if isinstance(x, list):
-        x = torch.tensor(x)
-    return x.to(device)
 
 def get_obs(sample):
     return sample["observation"] if "observation" in sample else sample
 
-def get_text_prompt(sample, tokenizer=None, device=None):
-    if "input" in sample and isinstance(sample["input"], str):
-        return sample["input"]
+def collate_batch(samples, device):
+    route, veh, ped, ego = [], [], [], []
+    input_ids, labels = [], []
 
-    if "input_ids" in sample and tokenizer is not None:
-        return tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
+    for s in samples:
+        obs = get_obs(s)
 
-    raise KeyError(f"No usable text prompt found. Keys: {sample.keys()}")
+        route.append(obs["route_descriptors"])
+        veh.append(obs["vehicle_descriptors"])
+        ped.append(obs["pedestrian_descriptors"])
+        ego.append(obs["ego_vehicle_descriptor"])
 
-def extract_dataset_answers(sample):
-    answers = []
-    if "response_content" in sample:
-        rc = sample["response_content"]
-        if isinstance(rc, str):
-            try:
-                parsed = json.loads(rc)
-                if isinstance(parsed, list):
-                    answers = parsed
-                elif isinstance(parsed, dict):
-                    answers = [parsed]
-            except Exception:
-                pass
-    return answers
+        if "input_ids" in s:
+            input_ids.append(torch.tensor(s["input_ids"]))
+            labels.append(torch.tensor(s["labels"]))
 
-def find_dataset_answer(dataset_answers, question):
-    if not isinstance(dataset_answers, list):
-        return "N/A"
+    route = torch.tensor(route, device=device).float()
+    veh = torch.tensor(veh, device=device).float()
+    ped = torch.tensor(ped, device=device).float()
+    ego = torch.tensor(ego, device=device).float()
 
-    q_clean = question.strip().lower()
-    for qa in dataset_answers:
-        if qa.get("question", "").strip().lower() == q_clean:
-            return qa.get("answer", "N/A")
-    return "N/A"
+    if input_ids:
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=0
+        ).to(device)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=-100
+        ).to(device)
+    else:
+        input_ids, labels = None, None
 
-def select_pedestrian_samples(dataset, n=10, seed=42):
-    rng = np.random.RandomState(seed)
-    shuffled = rng.permutation(len(dataset))
-
-    selected = []
-    for idx in shuffled:
-        item = dataset[int(idx)]
-        obs = get_obs(item)
-        ped = obs["pedestrian_descriptors"]
-        if isinstance(ped, list):
-            ped = torch.tensor(ped)
-        if (ped[:, 0] > 0).sum().item() > 0:
-            selected.append(item)
-        if len(selected) >= n:
-            break
-    return selected
+    return route, veh, ped, ego, input_ids, labels
 
 # =============================================================
-# MANUAL GENERATION (BASELINE ONLY)
+# LEGIBILITY (BATCH)
 # =============================================================
 
 @torch.no_grad()
-def greedy_generate_with_vectors(model, tokenizer, model_inputs, max_new_tokens=120):
-    input_ids = model_inputs["input_ids"].clone()
-    attention_mask = model_inputs["attention_mask"].clone()
+def compute_legibility_batch(route, veh, ped, ego):
 
-    for _ in range(max_new_tokens):
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            route_descriptors=model_inputs["route_descriptors"],
-            vehicle_descriptors=model_inputs["vehicle_descriptors"],
-            pedestrian_descriptors=model_inputs["pedestrian_descriptors"],
-            ego_vehicle_descriptor=model_inputs["ego_vehicle_descriptor"],
-        )
+    ego_xy = ego[:, :2]
+    ego_yaw = ego[:, 2]
 
-        logits = outputs.logits
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    ego_dir = torch.stack(
+        [torch.cos(ego_yaw), torch.sin(ego_yaw)], dim=-1
+    )
 
-        input_ids = torch.cat([input_ids, next_token], dim=1)
-        attention_mask = torch.cat(
-            [attention_mask, torch.ones_like(next_token)], dim=1
-        )
+    def compute(xy, exists, is_ped=False, crossing=None):
+        v = xy - ego_xy.unsqueeze(1)
+        v_norm = torch.norm(v, dim=-1) + 1e-6
 
-        if next_token.item() == tokenizer.eos_token_id:
-            break
+        cos_theta = (v * ego_dir.unsqueeze(1)).sum(-1) / v_norm
+        cos_theta = torch.clamp(cos_theta, -0.999, 0.999)
+        theta = torch.acos(cos_theta)
 
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        half_fov = (FOV_DEG / 2) * math.pi / 180.0
+        vis = torch.clamp(1 - theta / half_fov, min=0.0)
 
-# =============================================================
-# BUILD MODEL INPUTS (FOR BASELINE)
-# =============================================================
+        proj = (v * ego_dir.unsqueeze(1)).sum(-1, keepdim=True) * ego_dir.unsqueeze(1)
+        dist = torch.norm(v - proj, dim=-1)
 
-def build_model_inputs(model, tokenizer, sample, question):
-    device = next(model.parameters()).device
-    obs = get_obs(sample)
+        leg = vis * torch.exp(-BETA * torch.clamp(dist, max=50.0))
 
-    prompt = get_text_prompt(sample, tokenizer, device) + "\n\nQ: " + question + "\nA:"
-    enc = tokenizer(prompt, return_tensors="pt").to(device)
+        if is_ped:
+            weight = 1.0 + (CROSSING_BOOST - 1.0) * crossing
+            leg = leg * weight
+
+        return leg * exists, vis
+
+    veh_leg, veh_vis = compute(veh[:, :, 3:5], veh[:, :, 0] > 0)
+
+    ped_leg, ped_vis = compute(
+        ped[:, :, 2:4],
+        ped[:, :, 0] > 0,
+        is_ped=True,
+        crossing=ped[:, :, 8],
+    )
 
     return {
-        "input_ids": enc["input_ids"],
-        "attention_mask": enc["attention_mask"],
-        "route_descriptors": to_tensor(obs["route_descriptors"], device).unsqueeze(0).float(),
-        "vehicle_descriptors": to_tensor(obs["vehicle_descriptors"], device).unsqueeze(0).float(),
-        "pedestrian_descriptors": to_tensor(obs["pedestrian_descriptors"], device).unsqueeze(0).float(),
-        "ego_vehicle_descriptor": to_tensor(obs["ego_vehicle_descriptor"], device).unsqueeze(0).float(),
+        "scene": (veh_leg.sum(1) + ped_leg.sum(1)),
+        "veh": veh_leg.sum(1),
+        "ped": ped_leg.sum(1),
+        "cross": (ped_leg * ped[:, :, 8]).sum(1),
+        "visible": (veh_leg * (veh_vis > 0)).sum(1)
+                   + (ped_leg * (ped_vis > 0)).sum(1),
+        "non_visible": (veh_leg * (veh_vis == 0)).sum(1)
+                       + (ped_leg * (ped_vis == 0)).sum(1),
     }
 
-def run_model_on_sample(model, tokenizer, sample, question):
-    model_inputs = build_model_inputs(model, tokenizer, sample, question)
-    return greedy_generate_with_vectors(model, tokenizer, model_inputs)
-
 # =============================================================
-# OBSERVER-AWARE LEGIBILITY (RO-MAN 2022) + CROSSING
+# LANGUAGE (PPL)
 # =============================================================
-
-CROSSING_BOOST = 1.5   # multiplier for crossing pedestrians
-BETA = 0.5            # temperature for distance penalty
-FOV_DEG = 120.0       # field of view
-
-def get_ego_heading_vector(ego: torch.Tensor):
-    yaw = ego[..., 2]  # adjust if your schema differs
-    return torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
-
-def visibility_score(ego_pos, ego_dir, obj_pos, fov_deg=FOV_DEG):
-    v = obj_pos - ego_pos
-    v_norm = torch.norm(v) + 1e-6
-
-    cos_theta = torch.sum(ego_dir * v, dim=-1) / v_norm
-    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-    theta = torch.acos(cos_theta)
-
-    half_fov = (fov_deg / 2.0) * (math.pi / 180.0)
-    vis = 1.0 - (theta / half_fov)
-    return torch.clamp(vis, min=0.0)
-
-def distance_to_straight_ahead_goal(ego_pos, ego_dir, obj_pos):
-    v = obj_pos - ego_pos
-    proj = torch.sum(v * ego_dir, dim=-1, keepdim=True) * ego_dir
-    perp = v - proj
-    return torch.norm(perp, dim=-1)
 
 @torch.no_grad()
-def compute_per_object_legibility(sample, beta=BETA, fov_deg=FOV_DEG):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    obs = get_obs(sample)
+def compute_ppl_batch(model, input_ids, labels, route, veh, ped, ego):
+    if input_ids is None:
+        return None
 
-    vehicle = to_tensor(obs["vehicle_descriptors"], device).unsqueeze(0).float()
-    pedestrian = to_tensor(obs["pedestrian_descriptors"], device).unsqueeze(0).float()
-    ego = to_tensor(obs["ego_vehicle_descriptor"], device).unsqueeze(0).float()
+    outputs = model(
+        input_ids=input_ids,
+        labels=labels,
+        route_descriptors=route,
+        vehicle_descriptors=veh,
+        pedestrian_descriptors=ped,
+        ego_vehicle_descriptor=ego,
+    )
 
-    veh_exists = vehicle[:, :, 0] > 0
-    ped_exists = pedestrian[:, :, 0] > 0
-
-    veh_xy = vehicle[:, :, 3:5]
-    ped_xy = pedestrian[:, :, 2:4]
-    ego_xy = ego[:, :2]
-    ego_dir = get_ego_heading_vector(ego)[0]
-
-    results = []
-
-    # ---- Vehicles (no crossing concept) ----
-    for i in range(veh_xy.shape[1]):
-        if veh_exists[0, i]:
-            obj_pos = veh_xy[0, i]
-            dist = torch.norm(obj_pos - ego_xy[0]).item()
-
-            vis = visibility_score(ego_xy[0], ego_dir, obj_pos)
-            d_to_goal = distance_to_straight_ahead_goal(ego_xy[0], ego_dir, obj_pos)
-            leg = (vis * torch.exp(-beta * d_to_goal)).item()
-
-            results.append({
-                "type": "vehicle",
-                "index": i,
-                "distance_m": round(dist, 2),
-                "crossing": False,
-                "legibility": round(float(leg), 6),
-            })
-
-    # ---- Pedestrians (CROSSING-AWARE) ----
-    for i in range(ped_xy.shape[1]):
-        if ped_exists[0, i]:
-            obj_pos = ped_xy[0, i]
-            dist = torch.norm(obj_pos - ego_xy[0]).item()
-
-            vis = visibility_score(ego_xy[0], ego_dir, obj_pos)
-            d_to_goal = distance_to_straight_ahead_goal(ego_xy[0], ego_dir, obj_pos)
-
-            # === CROSSING FLAG (your schema: adjust index if needed) ===
-            # Common pattern: pedestrian[..., 8] = crossing (0/1)
-            crossing_flag = bool(int(pedestrian[0, i, 8].item()))
-
-            cross_weight = CROSSING_BOOST if crossing_flag else 1.0
-
-            leg = (vis * torch.exp(-beta * d_to_goal) * cross_weight).item()
-
-            results.append({
-                "type": "pedestrian",
-                "index": i,
-                "distance_m": round(dist, 2),
-                "crossing": crossing_flag,
-                "legibility": round(float(leg), 6),
-            })
-
-    return sorted(results, key=lambda x: x["distance_m"])
+    return torch.exp(outputs.loss).item()
 
 # =============================================================
-# MAIN EVALUATION LOOP
+# MODES
 # =============================================================
 
-def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=5, seed=42):
+def eval_legibility(model, dataset, batch_size, max_samples):
+    logs = {k: [] for k in ["scene","veh","ped","cross","visible","non_visible"]}
 
-    QUESTION_SET = [
-        "If a pedestrian suddenly starts crossing the road in front of you, how will you drive and why?",
-        "What is the distance of the farthest pedestrian?",
-        "What is the attention level on the nearest pedestrian?",
-        "What is your current speed?",
-        "What are the objects that you observe?",
-        "What is the distance and the direction of a certain pedestrian?",
-        "How are you going to drive in this situation and why?",
-        "Can you describe the current driving scenario?",
-        "What is your reaction if a deer suddenly appeared on the road?",
-    ]
+    device = next(model.parameters()).device
 
-    samples = select_pedestrian_samples(val_data, n=n_samples, seed=seed)
+    for i in range(0, min(len(dataset), max_samples), batch_size):
+        batch = dataset[i:i+batch_size]
+        route, veh, ped, ego, _, _ = collate_batch(batch, device)
 
-    print("\n================ LEGIBILITY EVALUATION ================\n")
+        out = compute_legibility_batch(route, veh, ped, ego)
 
-    for i, sample in enumerate(samples):
-        print(f"\n🔹 SAMPLE {i+1}")
-        print("--------------------------------------------------")
+        for k in logs:
+            logs[k].extend(out[k].cpu().numpy())
 
-        print("🔹 TEXT CONTEXT (LLM prompt):\n")
-        print(get_text_prompt(sample))
-        print("--------------------------------------------------")
+    return {k: (np.mean(v), np.std(v)) for k,v in logs.items()}
 
-        leg_scores = compute_per_object_legibility(sample)
+def eval_language(model, dataset, batch_size, max_samples):
+    ppls = []
+    device = next(model.parameters()).device
 
-        print("🔹 OBSERVER-AWARE LEGIBILITY (EGO ↔ OBJECT):")
-        for item in leg_scores:
-            cross = "CROSSING" if item["crossing"] else "not crossing"
-            print(
-                f"  - {item['type']} #{item['index']:>2} | "
-                f"distance={item['distance_m']:>5.2f}m | "
-                f"{cross:<12} | legibility={item['legibility']:.6f}"
-            )
-        print("--------------------------------------------------\n")
+    for i in range(0, min(len(dataset), max_samples), batch_size):
+        batch = dataset[i:i+batch_size]
+        route, veh, ped, ego, input_ids, labels = collate_batch(batch, device)
 
-        dataset_answers = extract_dataset_answers(sample)
+        ppl = compute_ppl_batch(model, input_ids, labels, route, veh, ped, ego)
+        if ppl is not None:
+            ppls.append(ppl)
 
-        for q_idx, question in enumerate(QUESTION_SET):
-            print(f"\n❓ Q{q_idx+1}: {question}")
+    return {"ppl": (np.mean(ppls), np.std(ppls))}
 
-            base_answer = run_model_on_sample(model, tokenizer, sample, question)
-            gt_answer = find_dataset_answer(dataset_answers, question)
-
-            print("\n🟡 BASELINE ANSWER:")
-            print(base_answer.strip())
-
-            print("\n🔵 DATASET / CHATGPT ANSWER:")
-            print(gt_answer.strip())
-
-            print("\n" + "-" * 90)
-
-        print("\n=====================================================\n")
+def eval_full(model, dataset, batch_size, max_samples):
+    res1 = eval_legibility(model, dataset, batch_size, max_samples)
+    res2 = eval_language(model, dataset, batch_size, max_samples)
+    return {**res1, **res2}
 
 # =============================================================
-# CLI
+# MAIN
 # =============================================================
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--data_path", default="data/vqa_test_1k.pkl")
-    parser.add_argument("--n_samples", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mode", default="full",
+                        choices=["full","legibility","language"])
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--max_samples", type=int, default=500)
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", default="legible_eval")
+
     args = parser.parse_args()
 
-    set_global_seed(args.seed)
+    if args.use_wandb:
+        wandb.init(project=args.wandb_project, name=f"eval_{args.mode}")
 
-    print(f"🔹 Loading checkpoint from: {args.model_dir}")
+    print("🔹 Loading model...")
 
     base_model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-2-7b-hf",
-        dtype=torch.float16,
+        torch_dtype=torch.float16,
         device_map="auto",
     )
 
     model = VectorRouteGuard(base_model).cuda()
 
-    safetensors_path = os.path.join(args.model_dir, "model.safetensors")
-    state_dict = load_file(safetensors_path, device="cuda")
+    state_dict = load_file(
+        os.path.join(args.model_dir, "model.safetensors"),
+        device="cuda"
+    )
     model.load_state_dict(state_dict, strict=False)
-
-    print("✅ Loaded trained VectorRouteGuard weights.")
 
     tokenizer = load_llama_tokenizer("meta-llama/Llama-2-7b-hf")
 
@@ -339,10 +226,24 @@ if __name__ == "__main__":
 
     val_data = patch_vector_fields(val_data)
 
-    evaluate_legibility_behavior(
-        model,
-        tokenizer,
-        val_data,
-        n_samples=args.n_samples,
-        seed=args.seed,
-    )
+    if args.mode == "legibility":
+        results = eval_legibility(model, val_data, args.batch_size, args.max_samples)
+
+    elif args.mode == "language":
+        results = eval_language(model, val_data, args.batch_size, args.max_samples)
+
+    else:
+        results = eval_full(model, val_data, args.batch_size, args.max_samples)
+
+    print("\n========= RESULTS =========\n")
+    for k,(m,s) in results.items():
+        print(f"{k:20s} | mean={m:.4f} | std={s:.4f}")
+    print("\n===========================\n")
+
+    if args.use_wandb:
+        wandb.log({f"{k}_mean": v[0] for k,v in results.items()} |
+                  {f"{k}_std": v[1] for k,v in results.items()})
+        wandb.finish()
+
+if __name__ == "__main__":
+    main()

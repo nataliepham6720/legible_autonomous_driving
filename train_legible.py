@@ -139,6 +139,10 @@ class VectorRouteGuard(torch.nn.Module):
         super().__init__()
         self.model = model
 
+        self.hidden_size = model.config.hidden_size
+        self.route_head = torch.nn.Linear(self.hidden_size, 2)  # predict (x,y)
+        self.route_queries = torch.nn.Parameter(torch.randn(30, self.hidden_size))
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -175,7 +179,14 @@ class VectorRouteGuard(torch.nn.Module):
             trace_vector("pedestrian", pedestrian_descriptors)
             trace_vector("ego", ego_vehicle_descriptor)
 
-        return self.model(
+        base_outputs = self.model.model(   # 🔥 THIS IS THE KEY
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
@@ -183,8 +194,44 @@ class VectorRouteGuard(torch.nn.Module):
             vehicle_descriptors=vehicle_descriptors,
             pedestrian_descriptors=pedestrian_descriptors,
             ego_vehicle_descriptor=ego_vehicle_descriptor,
+            output_hidden_states=True, 
+            return_dict=True,  
             **kwargs
         )
+
+        #   outputs = self.model(
+        #     input_ids=inputs["input_ids"],
+        #     attention_mask=inputs["attention_mask"],
+        #     route_descriptors=route,
+        #     vehicle_descriptors=veh,
+        #     pedestrian_descriptors=ped,
+        #     ego_vehicle_descriptor=ego,
+        #     output_hidden_states=True,
+        #     return_dict=True,
+        # )
+        print(outputs)
+        print(base_outputs)
+
+        # Extract predicted route
+        # hidden = outputs.hidden_states[-1]      # [B, T, H]
+        hidden = outputs["hidden_states"][-1]
+
+        # use last K tokens as trajectory
+        B = hidden.shape[0]
+
+        route_queries = self.route_queries.unsqueeze(0).expand(B, -1, -1)
+
+        # cross-attend (simple version)
+        route_tokens = hidden[:, :1, :] + route_queries   # anchor on CLS-like token
+
+        route_pred = self.route_head(route_tokens)
+
+        # route_pred = self.route_head(route_tokens)  # [B, K, 2]
+
+        # attach to outputs
+        outputs.route_pred = route_pred
+
+        return outputs
 
 # ============================================================
 # DATA PATCHER — SHAPE SAFE LOADING
@@ -218,7 +265,7 @@ def patch_vector_fields(dataset):
     return dataset
 
 # ============================================================
-# 🔥 NEW OBSERVER-AWARE LEGIBILITY LOSS (RO-MAN 2022)
+# 🔥 OBSERVER-AWARE LEGIBILITY LOSS (Taylor 2023)
 # ============================================================
 
 def compute_observer_aware_legibility_loss(
@@ -229,41 +276,59 @@ def compute_observer_aware_legibility_loss(
     crossing_boost: float = 1.5,
 ):
     """
-    Stable, differentiable Observer-Aware Legibility Loss (RO-MAN 2022),
-    made safe for LoRA + bitsandbytes training.
+    Observer-aware legibility:
+    visibility computed from EACH observer's perspective.
     """
 
-    # KEEP RAW TENSORS (do NOT use adapters here)
-    vehicle = inputs["vehicle_descriptors"].float()      # [B, 16, D]
+    vehicle = inputs["vehicle_descriptors"].float()      # [B, Nv, D]
     pedestrian = inputs["pedestrian_descriptors"].float()
     ego = inputs["ego_vehicle_descriptor"].float()
 
+    device = ego.device
     B = ego.shape[0]
 
     # ---- Existence masks ----
-    veh_exists = vehicle[:, :, 0] > 0      # [B, 16]
-    ped_exists = pedestrian[:, :, 0] > 0   # [B, 16]
+    veh_exists = vehicle[:, :, 0] > 0
+    ped_exists = pedestrian[:, :, 0] > 0
 
     if (veh_exists.sum() + ped_exists.sum()) == 0:
-        return torch.tensor(0.0, device=ego.device)
+        return torch.tensor(0.0, device=device)
 
     # ---- Positions ----
-    veh_xy = vehicle[:, :, 3:5]    # [B, 16, 2]
-    ped_xy = pedestrian[:, :, 2:4] # [B, 16, 2]
-    ego_xy = ego[:, :2]            # [B, 2]
+    veh_xy = vehicle[:, :, 3:5]
+    ped_xy = pedestrian[:, :, 2:4]
+    ego_xy = ego[:, :2]
 
-    # ---- Ego heading (goal = straight ahead) ----
-    ego_yaw = ego[:, 2]  # [B]
-    ego_dir = torch.stack(
-        [torch.cos(ego_yaw), torch.sin(ego_yaw)], dim=-1
-    )  # [B, 2]
+    # =========================================================
+    # 🔥 OBSERVER VIEW DIRECTIONS
+    # =========================================================
 
-    # ---- Helper functions (numerically safe) ----
-    def visibility_score(ego_pos, ego_dir, obj_pos):
-        v = obj_pos - ego_pos.unsqueeze(1)  # [B, K, 2]
+    # ---- Vehicles: use their heading ----
+    veh_yaw = vehicle[:, :, 5]  # adjust index if needed
+    veh_dir = torch.stack(
+        [torch.cos(veh_yaw), torch.sin(veh_yaw)], dim=-1
+    )  # [B, Nv, 2]
+
+    # ---- Pedestrians: use orientation if available, else face ego ----
+    if pedestrian.shape[-1] > 5:
+        ped_yaw = pedestrian[:, :, 5]
+        ped_dir = torch.stack(
+            [torch.cos(ped_yaw), torch.sin(ped_yaw)], dim=-1
+        )
+    else:
+        # fallback: face ego
+        v = ego_xy.unsqueeze(1) - ped_xy
+        ped_dir = v / (torch.norm(v, dim=-1, keepdim=True) + 1e-6)
+
+    # =========================================================
+    # 🔥 VISIBILITY FROM OBSERVER → EGO
+    # =========================================================
+
+    def visibility_from_observer(obs_pos, obs_dir):
+        v = ego_xy.unsqueeze(1) - obs_pos   # observer → ego
         v_norm = torch.norm(v, dim=-1) + 1e-6
 
-        cos_theta = (v * ego_dir.unsqueeze(1)).sum(dim=-1) / v_norm
+        cos_theta = (v * obs_dir).sum(dim=-1) / v_norm
         cos_theta = torch.clamp(cos_theta, -0.999, 0.999)
 
         theta = torch.acos(cos_theta)
@@ -272,33 +337,55 @@ def compute_observer_aware_legibility_loss(
         vis = 1.0 - (theta / half_fov)
         return torch.clamp(vis, min=0.0)
 
-    def distance_to_straight_ahead(ego_pos, ego_dir, obj_pos):
-        v = obj_pos - ego_pos.unsqueeze(1)
+    # =========================================================
+    # DISTANCE TO EGO TRAJECTORY (unchanged)
+    # =========================================================
+
+    ego_yaw = ego[:, 2]
+    ego_dir = torch.stack(
+        [torch.cos(ego_yaw), torch.sin(ego_yaw)], dim=-1
+    )
+
+    def distance_to_straight_ahead(obs_pos):
+        v = obs_pos - ego_xy.unsqueeze(1)
         proj = (v * ego_dir.unsqueeze(1)).sum(dim=-1, keepdim=True) * ego_dir.unsqueeze(1)
         perp = v - proj
         return torch.norm(perp, dim=-1)
 
-    # ---- Vehicle legibility ----
-    veh_vis = visibility_score(ego_xy, ego_dir, veh_xy)
-    veh_d = distance_to_straight_ahead(ego_xy, ego_dir, veh_xy)
+    # =========================================================
+    # VEHICLES
+    # =========================================================
+
+    veh_vis = visibility_from_observer(veh_xy, veh_dir)
+    veh_d = distance_to_straight_ahead(veh_xy)
+
     veh_leg = veh_vis * torch.exp(-beta * torch.clamp(veh_d, max=50.0))
     veh_leg = veh_leg * veh_exists.float()
 
-    # ---- Pedestrian legibility (crossing-aware) ----
-    ped_vis = visibility_score(ego_xy, ego_dir, ped_xy)
-    ped_d = distance_to_straight_ahead(ego_xy, ego_dir, ped_xy)
+    # =========================================================
+    # PEDESTRIANS
+    # =========================================================
 
-    ped_cross = pedestrian[:, :, 8]  # crossing flag
+    ped_vis = visibility_from_observer(ped_xy, ped_dir)
+    ped_d = distance_to_straight_ahead(ped_xy)
+
+    ped_cross = pedestrian[:, :, 8]
     ped_weight = 1.0 + (crossing_boost - 1.0) * ped_cross
 
     ped_leg = ped_vis * torch.exp(-beta * torch.clamp(ped_d, max=50.0)) * ped_weight
     ped_leg = ped_leg * ped_exists.float()
 
-    # ---- Aggregate ----
+    # =========================================================
+    # AGGREGATE
+    # =========================================================
+
     all_leg = torch.cat([veh_leg, ped_leg], dim=1)
     obs_legibility = all_leg.sum(dim=1)
 
-    # MINIMIZE negative legibility
+    # normalize (IMPORTANT for stability)
+    num_obs = veh_exists.sum(dim=1) + ped_exists.sum(dim=1)
+    obs_legibility = obs_legibility / (num_obs + 1e-6)
+
     leg_loss = -obs_legibility.mean()
 
     return leg_loss
@@ -336,16 +423,23 @@ class TrainerWithGeneration(transformers.Seq2SeqTrainer):
         lm_loss = outputs["loss"]
 
         # ----- Observer-aware legibility loss (detached for stability) -----
-        with torch.no_grad():
-            leg_loss = compute_observer_aware_legibility_loss(
-                model,
-                {
-                    "route_descriptors": route,
-                    "vehicle_descriptors": veh,
-                    "pedestrian_descriptors": ped,
-                    "ego_vehicle_descriptor": ego,
-                },
-            )
+        # with torch.no_grad():
+        # leg_loss = compute_observer_aware_legibility_loss(
+        #     model,
+        #     {
+        #         "route_descriptors": route,
+        #         "vehicle_descriptors": veh,
+        #         "pedestrian_descriptors": ped,
+        #         "ego_vehicle_descriptor": ego,
+        #     },
+        # )
+        route_pred = outputs.route_pred 
+
+        leg_loss = compute_legibility_from_predicted_route(
+            route_pred,
+            veh,
+            ped,
+        )
         print('legible score:', leg_loss)
         print('llm loss:', lm_loss)
         total_loss = lm_loss + self.legibility_weight * leg_loss
@@ -362,7 +456,7 @@ class TrainerWithGeneration(transformers.Seq2SeqTrainer):
 
 def train(
     base_model="meta-llama/Llama-2-7b-hf",
-    data_path="data/vqa_test_600.pkl",
+    data_path="data/vqa_test_400.pkl",
     batch_size=128,
     micro_batch_size=32,
     num_epochs=3,
