@@ -1,9 +1,8 @@
 # =============================================================
-# eval_legible.py
-# Observer-Aware Legibility Evaluation (RO-MAN 2022)
-# Goal assumed to be straight ahead; crossing-aware pedestrians
+# Observer-Aware Legibility Evaluation
 # =============================================================
 
+import re
 import argparse
 import os
 import json
@@ -13,13 +12,10 @@ import numpy as np
 from transformers import AutoModelForCausalLM
 from safetensors.torch import load_file
 
-from utils.model_utils import load_llama_tokenizer
+from utils.model_utils import load_llama_tokenizer, load_model
 from utils.training_utils import get_train_val_data
 from train_legible import VectorRouteGuard, patch_vector_fields
 
-# =============================================================
-# REPRODUCIBILITY
-# =============================================================
 
 def set_global_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -97,7 +93,7 @@ def select_pedestrian_samples(dataset, n=10, seed=42):
 def greedy_generate_with_vectors(model, tokenizer, model_inputs, max_new_tokens=120):
     input_ids = model_inputs["input_ids"].clone()
     attention_mask = model_inputs["attention_mask"].clone()
-
+    print(model)
     for _ in range(max_new_tokens):
         outputs = model(
             input_ids=input_ids,
@@ -108,7 +104,7 @@ def greedy_generate_with_vectors(model, tokenizer, model_inputs, max_new_tokens=
             ego_vehicle_descriptor=model_inputs["ego_vehicle_descriptor"],
         )
 
-        logits = outputs.logits
+        logits, _ = outputs
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         input_ids = torch.cat([input_ids, next_token], dim=1)
@@ -209,6 +205,121 @@ def safe_forward(model, inputs):
     return logits, hidden
 
 @torch.no_grad()
+def safe_forward_legible(model, inputs):
+    """
+    Run TWO forwards:
+    - LoRA path → logits (QA)
+    - Base path → hidden (route)
+    """
+
+    # ===== 1. LORA forward (for logits) =====
+    try:
+        out_lora = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            return_dict=True,
+        )
+        logits = getattr(out_lora, "logits", None)
+    except:
+        logits = None
+
+    # ===== 2. BASE forward (for hidden) =====
+    try:
+        out_base = model.model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            return_dict=True,
+        )
+        hidden = out_base.last_hidden_state
+    except:
+        hidden = None
+
+    return logits, hidden
+
+def compute_legibility_from_predicted_route(route_pred, vehicle, pedestrian):
+    beta = 0.5
+    crossing_boost = 1.5
+
+    # ---- existence masks ----
+    veh_exists = vehicle[:, :, 0] > 0
+    ped_exists = pedestrian[:, :, 0] > 0
+
+    # ---- positions ----
+    veh_xy = vehicle[:, :, 3:5]
+    ped_xy = pedestrian[:, :, 2:4]
+    ego_xy = route_pred[:, 0]
+
+    # ---- trajectory direction (Eq. 3) ----
+    traj_vec = route_pred[:, -1] - route_pred[:, 0]
+    utraj = traj_vec / (torch.norm(traj_vec, dim=-1, keepdim=True) + 1e-6)
+
+    # ---- observer orientations ----
+    veh_yaw = vehicle[:, :, 5]
+    veh_dir = torch.stack([torch.cos(veh_yaw), torch.sin(veh_yaw)], dim=-1)
+
+    # pedestrians face ego (proxy)
+    ped_dir = ego_xy.unsqueeze(1) - ped_xy
+    ped_dir = ped_dir / (torch.norm(ped_dir, dim=-1, keepdim=True) + 1e-6)
+
+    def visibility(xo, ro, fov_deg):
+        # Eq. (4)
+        v = ego_xy.unsqueeze(1) - xo
+        v_norm = torch.norm(v, dim=-1) + 1e-6
+
+        cos_theta = (v * ro).sum(-1) / v_norm
+        cos_theta = torch.clamp(cos_theta, -0.999, 0.999)
+
+        theta = torch.acos(cos_theta)
+
+        # Eq. (5)
+        half_fov = (fov_deg / 2.0) * math.pi / 180.0
+        return torch.clamp(1 - theta / half_fov, min=0.0)
+
+    def perp_distance(xo):
+        # Eq. (6)-(7)
+        v = xo - ego_xy.unsqueeze(1)
+        proj = (v * utraj.unsqueeze(1)).sum(-1, keepdim=True) * utraj.unsqueeze(1)
+        perp = v - proj
+        d = torch.norm(perp, dim=-1)
+
+        # distance cap (IMPORTANT)
+        return torch.minimum(d, torch.tensor(50.0, device=d.device))
+
+    # =========================
+    # VEHICLES (FOV = 300°)
+    # =========================
+    veh_vis = visibility(veh_xy, veh_dir, fov_deg=300.0)
+    veh_d = perp_distance(veh_xy)
+
+    veh_leg = veh_vis * torch.exp(-beta * veh_d)
+    veh_leg *= veh_exists.float()
+
+    # =========================
+    # PEDESTRIANS (FOV = 120°)
+    # =========================
+    ped_vis = visibility(ped_xy, ped_dir, fov_deg=120.0)
+    ped_d = perp_distance(ped_xy)
+
+    ped_leg = ped_vis * torch.exp(-beta * ped_d)
+
+    # crossing term: (1 + γ c_o)
+    ped_cross = pedestrian[:, :, 8]
+    ped_leg *= (1 + crossing_boost * ped_cross)
+
+    ped_leg *= ped_exists.float()
+
+    # =========================
+    # SCENE AGGREGATION (Eq. 10)
+    # =========================
+    total = veh_leg.sum(1) + ped_leg.sum(1)
+    num = veh_exists.sum(1) + ped_exists.sum(1)
+
+    # handle empty scene
+    scene_leg = total / (num + 1e-6)
+
+    return scene_leg.mean().item(),veh_leg, ped_leg
+
+@torch.no_grad()
 def compute_per_object_legibility(sample, beta=BETA, fov_deg=FOV_DEG):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     obs = get_obs(sample)
@@ -282,7 +393,7 @@ def get_predicted_route(model, sample):
         "attention_mask": torch.ones((1, 1), device=device),
     }
 
-    _, hidden = safe_forward(model, inputs)
+    _, hidden = safe_forward_legible(model, inputs)
 
     if hidden is None:
         raise RuntimeError("Failed to extract hidden states")
@@ -297,24 +408,87 @@ def get_predicted_route(model, sample):
 
     return route_pred
 
+@torch.no_grad()
+def get_route_for_eval(model, sample):
+    device = next(model.parameters()).device
+    obs = get_obs(sample)
 
+    route_gt = to_tensor(obs["route_descriptors"], device).unsqueeze(0).float()[..., :2]
+
+    # =========================================================
+    # Case 1: Finetuned model (has route_head)
+    # =========================================================
+    if hasattr(model, "route_head"):
+
+        inputs = {
+            "input_ids": torch.zeros((1, 1), dtype=torch.long, device=device),
+            "attention_mask": torch.ones((1, 1), device=device),
+            "route_descriptors": to_tensor(obs["route_descriptors"], device).unsqueeze(0).float(),
+            "vehicle_descriptors": to_tensor(obs["vehicle_descriptors"], device).unsqueeze(0).float(),
+            "pedestrian_descriptors": to_tensor(obs["pedestrian_descriptors"], device).unsqueeze(0).float(),
+            "ego_vehicle_descriptor": to_tensor(obs["ego_vehicle_descriptor"], device).unsqueeze(0).float(),
+        }
+
+        outputs = model(**inputs)
+
+        if isinstance(outputs, dict) and "route_pred" in outputs:
+            return outputs["route_pred"], route_gt, "predicted"
+
+    # =========================================================
+    # Case 2: Baseline model → use GT route
+    # =========================================================
+    return route_gt, route_gt, "ground_truth"
+
+def get_base_lm(model):
+    """
+    Robustly find the underlying model that supports `.generate()`
+    """
+
+    visited = set()
+    current = model
+
+    # walk through possible wrappers
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+
+        # ✅ FOUND correct model
+        if hasattr(current, "generate"):
+            return current
+
+        # try common wrapper attributes
+        if hasattr(current, "model"):
+            current = current.model
+            continue
+
+        if hasattr(current, "base_model"):
+            current = current.base_model
+            continue
+
+        if hasattr(current, "module"):  # DDP case
+            current = current.module
+            continue
+
+        break
+
+    raise RuntimeError("Could not find a model with `.generate()`")
 
 @torch.no_grad()
 def greedy_generate_with_vectors(model, tokenizer, model_inputs, max_new_tokens=120):
+
+    base_lm = get_base_lm(model)
+
     input_ids = model_inputs["input_ids"].clone()
     attention_mask = model_inputs["attention_mask"].clone()
 
     for _ in range(max_new_tokens):
 
-        logits, _ = safe_forward(model, {
-            **model_inputs,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        })
+        outputs = base_lm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
 
-        # ---- fallback if logits missing ----
-        if logits is None:
-            raise RuntimeError("Model did not return logits — cannot generate text")
+        logits = outputs.logits
 
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
@@ -328,14 +502,391 @@ def greedy_generate_with_vectors(model, tokenizer, model_inputs, max_new_tokens=
 
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
-def compute_qa_accuracy(pred, gt):
-    pred = pred.lower().strip()
-    gt = gt.lower().strip()
 
-    if gt == "n/a":
+def extract_number(text):
+    """
+    Extract first number from LLM output.
+    Handles integers and floats.
+    """
+    matches = re.findall(r"[-+]?\d*\.\d+|\d+", text)
+    if len(matches) == 0:
+        return None
+    return float(matches[0])
+
+def extract_dataset_answers(sample):
+    """
+    Parse multiple JSON lines from response_content.
+    """
+    answers = []
+
+    if "response_content" not in sample:
+        return answers
+
+    rc = sample["response_content"]
+
+    if not isinstance(rc, str):
+        return answers
+
+    # split by lines (each line is one JSON)
+    lines = rc.strip().split("\n")
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            qa = json.loads(line)
+            if isinstance(qa, dict) and "question" in qa:
+                answers.append(qa)
+        except:
+            continue
+
+    return answers
+
+# def compute_qa_accuracy(pred, gt):
+#     pred = pred.lower().strip()
+#     gt = gt.lower().strip()
+
+#     if gt == "n/a" or gt == "":
+#         return None
+
+#     # ---- exact match ----
+#     if gt in pred:
+#         return 1
+
+#     # ---- number matching (VERY IMPORTANT for this dataset) ----
+#     import re
+#     gt_nums = re.findall(r"\d+\.?\d*", gt)
+#     pred_nums = re.findall(r"\d+\.?\d*", pred)
+
+#     if len(gt_nums) > 0 and len(pred_nums) > 0:
+#         if gt_nums[0] == pred_nums[0]:
+#             return 1
+
+#     # ---- keyword overlap (fallback) ----
+#     gt_words = set(gt.split())
+#     pred_words = set(pred.split())
+
+#     overlap = len(gt_words & pred_words) / (len(gt_words) + 1e-6)
+
+#     return 1 if overlap > 0.5 else 0
+
+@torch.no_grad()
+def evaluate_qa_sample(model, tokenizer, sample):
+
+    # model.eval()
+
+    # ✅ always use base LM for QA
+    base_lm = get_base_lm(model)
+    print(type(base_lm))
+    base_lm.eval()
+
+    device = next(base_lm.parameters()).device
+
+    def generate_answer(prompt):
+        enc = tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(device)
+
+        input_len = enc["input_ids"].shape[1]
+
+        output_ids = base_lm.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=80,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+        # ✅ ONLY take generated tokens (remove prompt)
+        generated_ids = output_ids[0][input_len:]
+
+        return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    # =========================================================
+    # CASE 1: QA dataset
+    # =========================================================
+    if "response_content" in sample:
+
+        dataset_answers = extract_dataset_answers(sample)
+        results = []
+
+        base_prompt = get_text_prompt(sample, tokenizer)
+
+        for qa in dataset_answers:
+            question = qa["question"]
+            gt = qa["answer"]
+
+            prompt = f"{base_prompt}\n\nQ: {question}\nA:"
+            pred = generate_answer(prompt)
+
+            obs = get_obs(sample)
+            acc = compute_qa_accuracy(pred, gt, tokenizer, base_lm)
+
+            print("\n================ FRAME CONTEXT ================")
+            print("🚗 #Vehicles:", int((torch.tensor(obs["vehicle_descriptors"])[:,0] > 0).sum()))
+            print("🚶 #Pedestrians:", int((torch.tensor(obs["pedestrian_descriptors"])[:,0] > 0).sum()))
+            print("==============================================\n")
+
+            print("\n" + "="*60)
+            print(f"FRAME QA COMPARISON")
+            print("="*60)
+
+            print(f"\n❓ Question:\n{question}")
+
+            print("\n🟡 Predicted Answer:")
+            print(pred)
+
+            print("\n🔵 Ground Truth Answer:")
+            print(gt)
+
+            print("\n📊 Score:", acc)
+            print("="*60 + "\n")
+
+            results.append(acc if acc is not None else 0)
+
+        return results
+
+    # =========================================================
+    # CASE 2: instruction dataset
+    # =========================================================
+    elif "output" in sample:
+        QUESTION_SET = [
+            "What is the distance of the farthest pedestrian?",
+            "What is your current speed?",
+            "Are there any traffic light ahead?",
+            "How many pedestrians are on the scene at the current point?",
+            "How many pedestrians are on the scene at the current point?",
+        ]
+        total_acc = 0
+        for question in QUESTION_SET:
+            # question = qa["question"]
+            # gt = qa["answer"]
+
+            prompt = f"Q: {question}\nA:"
+            # prompt = sample.get("input", "")
+            print("Prompt:", prompt)
+            gt = sample["output"]
+
+            pred = generate_answer(prompt)
+            print("\n🟡 Predicted Answer:")
+            print(pred)
+
+            obs = get_obs(sample)
+            acc = compute_qa_accuracy(pred, gt, tokenizer, base_lm)
+            total_acc += acc
+
+        print("\n================ FRAME CONTEXT ================")
+        print("🚗 #Vehicles:", int((torch.tensor(obs["vehicle_descriptors"])[:,0] > 0).sum()))
+        print("🚶 #Pedestrians:", int((torch.tensor(obs["pedestrian_descriptors"])[:,0] > 0).sum()))
+        print("==============================================\n")
+
+        # print("\n" + "="*60)
+        # print(f"FRAME QA COMPARISON")
+        # print("="*60)
+
+        # print(f"\n❓ Question:\n{question}")
+
+        print("\n🟡 Predicted Answer:")
+        print(pred)
+
+        print("\n🔵 Ground Truth Answer:")
+        print(gt)
+
+        print("\n📊 Score:", acc)
+        print("="*60 + "\n")
+
+        # results.append(acc if acc is not None else 0)
+
+        return [total_acc/len(QUESTION_SET)]
+
+    return []
+
+
+def compute_qa_accuracy(pred, gt, tokenizer=None, model=None):
+    """
+    Compare prediction and ground truth in embedding space.
+    Uses token-level distributions (mean pooled).
+    """
+
+    if gt in ["", "n/a"]:
         return None
 
-    return 1 if gt in pred else 0
+    print(gt)
+
+    # -------------------------
+    # tokenize
+    # -------------------------
+    device = next(model.parameters()).device
+
+    pred_tokens = tokenizer(
+        pred,
+        return_tensors="pt",
+        truncation=True,
+        max_length=128,
+    ).to(device)
+
+    gt_tokens = tokenizer(
+        gt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=128,
+    ).to(device)
+
+    # -------------------------
+    # get embeddings (last hidden)
+    # -------------------------
+    with torch.no_grad():
+        pred_hidden = model(
+            input_ids=pred_tokens["input_ids"],
+            attention_mask=pred_tokens["attention_mask"],
+            output_hidden_states=True,
+            return_dict=True,
+        ).hidden_states[-1]
+
+        gt_hidden = model(
+            input_ids=gt_tokens["input_ids"],
+            attention_mask=gt_tokens["attention_mask"],
+            output_hidden_states=True,
+            return_dict=True,
+        ).hidden_states[-1]
+
+    # -------------------------
+    # mean pool (token distribution summary)
+    # -------------------------
+    pred_emb = pred_hidden.mean(dim=1)
+    gt_emb = gt_hidden.mean(dim=1)
+
+    # -------------------------
+    # cosine similarity
+    # -------------------------
+    sim = torch.nn.functional.cosine_similarity(pred_emb, gt_emb).item()
+
+    # -------------------------
+    # threshold decision
+    # -------------------------
+    # tune this if needed
+    return sim
+# def compute_grounded_qa_accuracy(pred, question, obs):
+#     """
+#     Grounded QA evaluation based on scene semantics.
+    
+#     Args:
+#         pred: model output (string)
+#         question: question string
+#         obs: observation dict (contains descriptors)
+
+#     Returns:
+#         1 / 0 / None
+#     """
+
+#     pred = pred.lower().strip()
+#     question = question.lower()
+
+#     # =========================
+#     # 🚶 COUNT PEDESTRIANS
+#     # =========================
+#     if "how many pedestrians" in question:
+#         ped = torch.tensor(obs["pedestrian_descriptors"])
+#         gt = int((ped[:, 0] > 0).sum().item())
+
+#         pred_num = extract_number(pred)
+#         if pred_num is None:
+#             return 0
+
+#         return 1 if int(pred_num) == gt else 0
+
+#     # =========================
+#     # 🚗 COUNT VEHICLES
+#     # =========================
+#     if "how many vehicles" in question:
+#         veh = torch.tensor(obs["vehicle_descriptors"])
+#         gt = int((veh[:, 0] > 0).sum().item())
+
+#         pred_num = extract_number(pred)
+#         if pred_num is None:
+#             return 0
+
+#         return 1 if int(pred_num) == gt else 0
+
+#     # =========================
+#     # 📏 FARTHEST PEDESTRIAN
+#     # =========================
+#     if "farthest pedestrian" in question:
+#         ped = torch.tensor(obs["pedestrian_descriptors"])
+
+#         mask = ped[:, 0] > 0
+#         if mask.sum() == 0:
+#             return None
+
+#         ped_xy = ped[mask][:, 2:4]
+#         dist = torch.norm(ped_xy, dim=-1)
+#         gt = dist.max().item()
+
+#         pred_num = extract_number(pred)
+#         if pred_num is None:
+#             return 0
+
+#         # allow tolerance (meters)
+#         return 1 if abs(pred_num - gt) < 2.0 else 0
+
+#     # =========================
+#     # 🚗 SPEED (if available)
+#     # =========================
+#     if "speed" in question:
+#         ego = torch.tensor(obs["ego_vehicle_descriptor"])
+
+#         # adjust index if needed
+#         gt = ego[0].item()
+
+#         pred_num = extract_number(pred)
+#         if pred_num is None:
+#             return 0
+
+#         return 1 if abs(pred_num - gt) < 2.0 else 0
+
+#     # =========================
+#     # ❓ OPEN-ENDED → skip
+#     # =========================
+#     return None
+
+def extract_dataset_answers(sample):
+    """
+    Extract QA pairs from response_content.
+    Handles multiple JSON lines.
+    """
+
+    answers = []
+
+    if "response_content" not in sample:
+        return answers
+
+    rc = sample["response_content"]
+
+    if not isinstance(rc, str):
+        return answers
+
+    # each line is one JSON object
+    lines = rc.strip().split("\n")
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            qa = json.loads(line)
+            if isinstance(qa, dict) and "question" in qa:
+                answers.append(qa)
+        except:
+            continue
+
+    return answers
 
 def compute_legibility_from_predicted_route(route_pred, vehicle, pedestrian):
     beta = 0.5
@@ -397,12 +948,11 @@ def compute_legibility_from_predicted_route(route_pred, vehicle, pedestrian):
 def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=42):
 
     QUESTION_SET = [
-        "If a pedestrian suddenly starts crossing the road in front of you, how will you drive and why?",
         "What is the distance of the farthest pedestrian?",
         "What is your current speed?",
-        "How are you going to drive in this situation and why?",
-        "What is the distance and the direction of a certain pedestrian?",
-        "Can you describe the current driving scenario?",
+        "Are there any traffic light ahead?",
+        "How many pedestrians are on the scene at the current point?",
+        "How many pedestrians are on the scene at the current point?",
     ]
 
     samples = select_pedestrian_samples(val_data, n=n_samples, seed=seed)
@@ -427,7 +977,8 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=
         # =========================================================
         # 🚗 ROUTE PREDICTION
         # =========================================================
-        route_pred = get_predicted_route(model, sample)
+        # route_pred = get_predicted_route(model, sample)
+        route_pred, route_gt, route_type = get_route_for_eval(model, sample)
 
         print("🔹 Predicted Route (first 5 points):")
         print(route_pred[0, :5])
@@ -438,7 +989,7 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=
         # ---- L2 LOSS ----
         min_len = min(route_pred.shape[1], route_gt.shape[1])
         l2 = torch.norm(route_pred[:, :min_len] - route_gt[:, :min_len], dim=-1).mean().item()
-        total_l2.append(l2)
+        total_l2.append(l2/torch.norm(route_gt[:, :min_len], dim=-1).mean().item())
 
         print(f"\n📏 Route L2 Error: {l2:.4f}")
 
@@ -495,17 +1046,19 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=
             return veh_leg, ped_leg, veh_exists, ped_exists
 
         veh_leg, ped_leg, veh_exists, ped_exists = per_agent_legibility(route_pred, veh, ped)
-
+        veh_leg_gt, ped_leg_gt, _, _ = per_agent_legibility(route_gt, veh, ped)
         print("\n👀 Legibility per agent:")
 
         for j in range(veh_leg.shape[1]):
             if veh_exists[0, j]:
                 print(f"  🚗 Vehicle {j}: {veh_leg[0, j].item():.4f}")
+                print(f"  🚗 Vehicle {j} GT route: {veh_leg_gt[0, j].item():.4f}")
 
         for j in range(ped_leg.shape[1]):
             if ped_exists[0, j]:
                 cross = int(ped[0, j, 8].item())
                 print(f"  🚶 Pedestrian {j} (cross={cross}): {ped_leg[0, j].item():.4f}")
+                print(f"  🚶 Pedestrian {j} GT route (cross={cross}): {ped_leg_gt[0, j].item():.4f}")
 
         leg_score = compute_legibility_from_predicted_route(route_pred, veh, ped)
         total_leg.append(leg_score)
@@ -519,29 +1072,18 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=
         # =========================================================
         # 🧠 QA EVALUATION
         # =========================================================
+        print(f"\n🧠 Evaluating QA / Instruction for sample {i+1}")
 
-        for q_idx, question in enumerate(QUESTION_SET):
+        accs = evaluate_qa_sample(model, tokenizer, sample)
+        # acc = compute_qa_accuracy(pred, gt, tokenizer, base_lm)
 
-            print(f"\n❓ Q{q_idx+1}: {question}")
+        # keep only valid scores
+        valid_accs = [a for a in accs if a is not None]
 
-            pred = run_model_on_sample(model, tokenizer, sample, question)
-            gt = find_dataset_answer(dataset_answers, question)
-
-            print("\n🟡 Model Answer:")
-            print(pred.strip())
-
-            print("\n🔵 Ground Truth:")
-            print(gt.strip())
-
-            acc = compute_qa_accuracy(pred, gt)
-            if acc is not None:
-                total_acc.append(acc)
-                print(f"\n✅ Correct: {acc}")
-            else:
-                print("\n⚠️ Skipped (no GT)")
-
-            print("-" * 80)
-
+        if len(valid_accs) > 0:
+            total_acc.extend(valid_accs)
+        else:
+            print("⚠️ No valid QA found for this sample")
     # =========================================================
     # FINAL METRICS
     # =========================================================
@@ -553,12 +1095,13 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=
     print("\n================ FINAL RESULTS ================\n")
     print(f"QA Accuracy:        {avg_acc:.4f}")
     print(f"Route Legibility:   {avg_leg:.4f}")
-    print(f"Route L2 Error:     {avg_l2:.4f}")
+    print(f"Route relative L2 Error:     {avg_l2:.4f}")
     print("\n=============================================\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", required=True)
+    parser.add_argument("--model_type", default="legible")
     parser.add_argument("--data_path", default="data/vqa_test_1k.pkl")
     parser.add_argument("--n_samples", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -568,19 +1111,32 @@ if __name__ == "__main__":
 
     print(f"🔹 Loading checkpoint from: {args.model_dir}")
 
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model_token = "meta-llama/Llama-2-7b-hf"
+
+    if args.model_type=="legible":
+        base_model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-2-7b-hf",
         dtype=torch.float16,
         device_map="auto",
-    )
+        )
 
-    model = VectorRouteGuard(base_model).cuda()
+        model = VectorRouteGuard(base_model).cuda()
 
-    safetensors_path = os.path.join(args.model_dir, "model.safetensors")
-    state_dict = load_file(safetensors_path, device="cuda")
-    model.load_state_dict(state_dict, strict=False)
+        safetensors_path = os.path.join(args.model_dir, "model.safetensors")
+        state_dict = load_file(safetensors_path, device="cuda")
+        model.load_state_dict(state_dict, strict=False)
 
-    print("✅ Loaded trained VectorRouteGuard weights.")
+        print("✅ Loaded trained VectorRouteGuard weights.")
+    else:
+        base_model = load_model(
+            base_model=base_model_token,
+            resume_from_checkpoint=args.model_dir,
+            lora_r=16,
+        ).cuda()
+
+        model = VectorRouteGuard(base_model).cuda()
+
+        print("✅ Loaded trained VectorRouteGuard + LoRA weights.")
 
     tokenizer = load_llama_tokenizer("meta-llama/Llama-2-7b-hf")
 
