@@ -56,6 +56,7 @@ While the training and evaluation datasets already include pre-collected Driving
     ```sh
     python eval_legible.py \
         --model_dir ./legible \
+        --model_type legible \
         --data_path data/vqa_test_1k.pkl \
         --n_samples 20 \
         --seed 2026

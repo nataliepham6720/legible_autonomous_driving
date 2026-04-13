@@ -413,7 +413,7 @@ def get_route_for_eval(model, sample):
     device = next(model.parameters()).device
     obs = get_obs(sample)
 
-    route_gt = to_tensor(obs["route_descriptors"], device).unsqueeze(0).float()[..., :2]
+    route_gt = to_tensor(obs["ego_vehicle_descriptors"], device).unsqueeze(0).float()[..., :2]
 
     # =========================================================
     # Case 1: Finetuned model (has route_head)
@@ -945,7 +945,7 @@ def compute_legibility_from_predicted_route(route_pred, vehicle, pedestrian):
 # =============================================================
 # MAIN EVALUATION LOOP
 # =============================================================
-def evaluate_legibility_behavior(model, tokenizer, val_data, n_samples=20, seed=42):
+def evaluate_legibility_behavior(model, model_type, tokenizer, val_data, n_samples=20, seed=42):
 
     QUESTION_SET = [
         "What is the distance of the farthest pedestrian?",
@@ -1150,6 +1150,7 @@ if __name__ == "__main__":
 
     evaluate_legibility_behavior(
         model,
+        model_type=args.model_type,
         tokenizer,
         val_data,
         n_samples=args.n_samples,
