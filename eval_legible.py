@@ -5,8 +5,9 @@ import json
 import math
 import torch
 import numpy as np
-from transformers import AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
+import torch.nn.functional as F
+# from sentence_transformers import SentenceTransformer
 from safetensors.torch import load_file
 
 from utils.model_utils import load_llama_tokenizer, load_model
@@ -70,6 +71,28 @@ def select_pedestrian_samples(dataset, n=10, seed=42):
         if len(selected) >= n:
             break
     return selected
+
+class SimpleEmbedder:
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device).eval()
+
+    @torch.no_grad()
+    def encode(self, texts):
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        ).to(self.device)
+
+        outputs = self.model(**inputs)
+
+        # mean pooling
+        emb = outputs.last_hidden_state.mean(dim=1)
+
+        return emb
 
 @torch.no_grad()
 def safe_forward_legible(model, inputs):
@@ -314,9 +337,13 @@ def evaluate_qa_sample(model, tokenizer, sample, embed_model):
     # =========================
     # EMBEDDING COSINE SIM
     # =========================
-    def cosine_sim(a, b):
-        emb = embed_model.encode([a, b], convert_to_tensor=True)
-        return torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0).item()
+    def cosine_sim(pred, gt):
+        # embed_model = SimpleEmbedder()
+        emb = embed_model.encode([pred, gt])
+        cos = F.cosine_similarity(emb[0], emb[1], dim=0).item()
+        # emb = embed_model.encode([a, b], convert_to_tensor=True)
+        # return torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0).item()
+        return cos
 
     # =========================
     # SCENE GROUND TRUTH
@@ -639,7 +666,7 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, model_type="vanilla
         # 🧠 QA EVALUATION
         # =========================================================
         print(f"\n🧠 Evaluating QA / Instruction for sample {i+1}")
-        embed_model = SentenceTransformer("all-mpnet-base-v2")
+        embed_model = SimpleEmbedder() # SentenceTransformer("all-mpnet-base-v2")
         accs = evaluate_qa_sample(model, tokenizer, sample, embed_model)
         # acc = compute_qa_accuracy(pred, gt, tokenizer, base_lm)
 
