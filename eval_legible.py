@@ -652,12 +652,6 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, model_type="vanilla
         num_gt = veh_exists_gt.sum(1) + ped_exists_gt.sum(1)
 
         total_leg_gt = total_gt / (num_gt + 1e-6)
-        # print(total_leg_gt)
-        # leg_score, _, _ = compute_legibility_from_predicted_route(route_pred, veh, ped)
-        # total_leg.append(leg_score)
-        # # total_leg.append("--------------")
-        # leg_score_gt, _, _ = compute_legibility_from_predicted_route(route_gt, veh, ped)
-        # total_leg.append(leg_score_gt)
 
         print(f"\n📊 Total Legibility Score on new route: {total_leg.item():.4f}")
         print(f"\n📊 Total Legibility Score on gt route: {total_leg_gt.item():.4f}")
@@ -667,28 +661,20 @@ def evaluate_legibility_behavior(model, tokenizer, val_data, model_type="vanilla
         # =========================================================
         print(f"\n🧠 Evaluating QA / Instruction for sample {i+1}")
         embed_model = SimpleEmbedder() # SentenceTransformer("all-mpnet-base-v2")
-        accs = evaluate_qa_sample(model, tokenizer, sample, embed_model)
-        # acc = compute_qa_accuracy(pred, gt, tokenizer, base_lm)
+        acc = evaluate_qa_sample(model, tokenizer, sample, embed_model)
 
-        # keep only valid scores
-        valid_accs = [a for a in accs if a is not None]
 
-        if len(valid_accs) > 0:
-            total_acc.extend(valid_accs)
-        else:
-            print("⚠️ No valid QA found for this sample")
-    # =========================================================
-    # FINAL METRICS
-    # =========================================================
-
-    avg_acc = np.mean(total_acc) if total_acc else 0.0
-    avg_leg = np.mean(total_leg)
-    avg_l2 = np.mean(total_l2)
+    avg_acc = np.mean(acc["scene_accuracy"]) 
+    avg_cosine_sim = np.mean(acc["cosine_similarity"])
 
     print("\n================ FINAL RESULTS ================\n")
     print(f"QA Accuracy:        {avg_acc:.4f}")
-    print(f"Route Legibility:   {avg_leg:.4f}")
-    print(f"Route relative L2 Error:     {avg_l2:.4f}")
+    print(f"LM similarity:     {avg_cosine_sim:.4f}")
+    if model_type == "vanilla":
+        print(f"Route Legibility:   {total_leg_gt.item():.4f}")
+    else:
+        print(f"Route Legibility:   {total_leg.item():.4f}")
+
     print("\n=============================================\n")
 
 if __name__ == "__main__":
