@@ -159,8 +159,14 @@ def _val_data_from_val_dataset(val_dataset, tokenizer):
     return val_dataset["test"].map(
         partial(generate_and_tokenize_prompt, tokenizer, user_input_ids=True),
         remove_columns=[],
-        num_proc=8,
+        desc="Processing val",
+        num_proc=1 # 8,
     )
+    # val_data = val_data.map(
+    # process_fn,
+    # num_proc=1,          # ← was 8; parallel map has non-deterministic ordering
+    # desc="Processing val",
+    # )
 
 
 def get_train_val_data(

@@ -684,6 +684,7 @@ def _try_load_custom_modules(model, model_dir: str) -> bool:
 def evaluate_legibility_behavior(
     model, tokenizer, val_data, model_type="vanilla", n_samples=20, seed=42
 ):
+    set_global_seed(seed)
     samples = select_pedestrian_samples(val_data, n=n_samples, seed=seed)
 
     embed_model = SimpleEmbedder()
