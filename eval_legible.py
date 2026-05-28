@@ -314,6 +314,58 @@ def parse_number_robust(text: str):
     return float(best_val) if best_val is not None else None
 
 
+def parse_count_sum(text: str) -> float | None:
+    """
+    Sum ALL numeric mentions in text so multi-part descriptions like
+    "one person walking and a group of three more" → 1 + 3 = 4.
+ 
+    Strategy
+    --------
+    1. Replace every word-number token (longest match first, left-to-right)
+       with its digit equivalent so the digit regex can sweep once.
+    2. Re-run the digit regex and sum every match.
+    3. Return None only when no numbers at all were found.
+ 
+    Excluded from summation
+    -----------------------
+    • Pure ordinals / positional words: "first", "second", "third" …
+    • Measurement modifiers that aren't counts: "one-half", "quarter" …
+      (these are replaced by 0 so they don't inflate the sum)
+    • Numbers that appear inside timestamps or licence-plate-like strings
+      (heuristic: skip matches surrounded by letters on both sides).
+    """
+    ORDINALS = {
+        "first", "second", "third", "fourth", "fifth",
+        "sixth", "seventh", "eighth", "ninth", "tenth",
+    }
+    # Fraction words → 0 (they're parts of a whole, not agent counts)
+    FRACTION_WORDS = {
+        "half", "one-half", "and a half", "quarter", "one-quarter",
+        "two-and-a-half", "two and a half", "two and one-half",
+    }
+ 
+    t = text.lower()
+ 
+    # Remove fraction words first (replace with "0") to avoid partial matches
+    for fw in sorted(FRACTION_WORDS, key=len, reverse=True):
+        t = t.replace(fw, " 0 ")
+ 
+    # Replace word numbers longest-first to avoid "one" eating "nineteen"
+    for word, val in sorted(_WORD_TO_NUM.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if word in ORDINALS:
+            continue
+        # Use word-boundary-aware replacement
+        t = re.sub(r'\b' + re.escape(word.strip()) + r'\b', f" {int(val)} ", t)
+ 
+    # Sweep for digit tokens; skip tokens glued to letters (e.g. "A4", "347-9XZ")
+    total = 0.0
+    found = False
+    for m in re.finditer(r"(?<![a-z])(\d+(?:\.\d+)?)(?![a-z])", t):
+        total += float(m.group(1))
+        found  = True
+ 
+    return total if found else None
+
 def parse_yes_no_robust(text: str):
     """
     Classify a free-form answer as 'yes', 'no', or None.
@@ -380,18 +432,24 @@ def score_traffic_light(pred_text: str, gt_val: float) -> float:
 
 def score_count(pred_text: str, gt_val: int) -> float:
     """
-    ±1 tolerance for agent-count questions.
-    Exact match scores 1.0; off-by-one scores 0.5; further off scores 0.0.
+    Graduated accuracy for agent-count questions.
+ 
+    - Sums ALL numeric mentions in the prediction (handles descriptions
+      like "one person walking and three more by the car" → 4).
+    - Uses a linear decay so larger GT values still award partial credit:
+          score = max(0,  1 - |pred - gt| / (gt + 1))
+      This means:
+        - exact match          → 1.0
+        - off by 1 (gt=1)      → 0.5
+        - off by 1 (gt=11)     → 1 - 1/12 ≈ 0.92  
+        - off by 5 (gt=11)     → 1 - 5/12 ≈ 0.58
+        - completely wrong (0 vs 11) → 0.0
     """
-    pred_val = parse_number_robust(pred_text)
+    pred_val = parse_count_sum(pred_text)
     if pred_val is None:
         return 0.0
     err = abs(round(pred_val) - gt_val)
-    if err == 0:
-        return 1.0
-    if err == 1:
-        return 0.5
-    return 0.0
+    return max(0.0, 1.0 - err / (gt_val + 1))
 
 
 @torch.no_grad()
