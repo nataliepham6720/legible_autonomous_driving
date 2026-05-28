@@ -252,32 +252,30 @@ class VectorLMWithLoRA(PeftModelForCausalLM):
         return {"loss": loss}
 
     def generate(self, **kwargs):
-        route_descriptors = kwargs["route_descriptors"]
-        vehicle_descriptors = kwargs["vehicle_descriptors"]
-        pedestrian_descriptors = kwargs["pedestrian_descriptors"]
-        ego_vehicle_descriptor = kwargs["ego_vehicle_descriptor"]
+        route_descriptors      = kwargs.pop("route_descriptors", None)
+        vehicle_descriptors    = kwargs.pop("vehicle_descriptors", None)
+        pedestrian_descriptors = kwargs.pop("pedestrian_descriptors", None)
+        ego_vehicle_descriptor = kwargs.pop("ego_vehicle_descriptor", None)
 
-        vector_obs = VectorObservation(
-            route_descriptors=route_descriptors,
-            vehicle_descriptors=vehicle_descriptors,
-            pedestrian_descriptors=pedestrian_descriptors,
-            ego_vehicle_descriptor=ego_vehicle_descriptor,
-        )
-        encoder_output = self.vector_encoder(vector_obs)
-        query_embeds = self.llm_proj(encoder_output)
+        if route_descriptors is not None:
+            vector_obs = VectorObservation(
+                route_descriptors=route_descriptors,
+                vehicle_descriptors=vehicle_descriptors,
+                pedestrian_descriptors=pedestrian_descriptors,
+                ego_vehicle_descriptor=ego_vehicle_descriptor,
+            )
+            encoder_output = self.vector_encoder(vector_obs)
+            kwargs["query_embeds"] = self.llm_proj(encoder_output)
 
-        kwargs["query_embeds"] = query_embeds
-        kwargs["input_ids"] = kwargs.pop("user_input_ids")
-        kwargs["attention_mask"] = kwargs.pop("user_attention_mask")
+        # Key rename — only do this if caller actually sent user_input_ids
+        if "user_input_ids" in kwargs:
+            kwargs["input_ids"] = kwargs.pop("user_input_ids")
+            kwargs["attention_mask"] = kwargs.pop("user_attention_mask")
+
         if "generation_config" not in kwargs:
-            kwargs[
-                "generation_config"
-            ] = (
-                self.generation_config
-            )  # Override the generation config to make the padding tokens correct
-        outputs = self.base_model.generate(**kwargs)
-        return outputs
+            kwargs["generation_config"] = self.generation_config
 
+        return self.base_model.generate(**kwargs)
 
 def ingest_vectors(
     input_ids, inputs_embeds, input_vectors, attention_mask, labels=None

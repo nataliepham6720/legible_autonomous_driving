@@ -4,7 +4,7 @@ from typing import Tuple
 import torch
 from peft import LoraConfig, prepare_model_for_kbit_training, set_peft_model_state_dict
 from transformers import GenerationConfig, LlamaTokenizer
-
+from transformers import BitsAndBytesConfig
 from models.vector_lm import LlamaForCausalLMVectorInput, VectorLMWithLoRA
 
 # class LoraConfigVectorLM(LoraConfig):
@@ -84,9 +84,11 @@ def load_model(
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
 
     # Initialize model
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     llama_model = LlamaForCausalLMVectorInput.from_pretrained(
         base_model,
-        load_in_8bit=load_in_8bit,
+        # load_in_8bit=load_in_8bit,
+        quantization_config=bnb_config,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
