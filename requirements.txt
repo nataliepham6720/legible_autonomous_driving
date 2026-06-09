@@ -14,10 +14,8 @@ click==8.1.6
 huggingface_hub>=0.23.0
 numpy<2.0
 torchvision==0.24.1
-
-transformers==4.35.2
-peft==0.6.2
-accelerate==0.24.1
+transformers==4.46.3
+accelerate==0.34.2
 torch>=2.0.0
 fire
 wandb

@@ -92,6 +92,20 @@ def load_model(
         torch_dtype=torch.float16,
         device_map=device_map,
     )
+    for _module in llama_model.modules():
+        _state = getattr(_module, 'state', None)
+        if _state is not None and not hasattr(_state, 'memory_efficient_backward'):
+            _state.memory_efficient_backward = False
+
+    try:
+        import peft.tuners.lora.bnb as _peft_bnb
+        _orig_dequant = _peft_bnb.dequantize_bnb_weight
+        def _safe_dequant(weight, state=None):
+            return _orig_dequant(weight, state=state).clone()
+        _peft_bnb.dequantize_bnb_weight = _safe_dequant
+    except Exception:
+        pass
+        
     lora_config = LoraConfigVectorLM(
         r=lora_r,
         lora_alpha=lora_alpha,

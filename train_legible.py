@@ -602,7 +602,7 @@ def train(
         learning_rate=learning_rate,
         fp16=True,
         logging_steps=10,
-        eval_strategy="steps",
+        evaluation_strategy="steps",
         eval_steps=eval_steps,
         save_steps=100,
         save_total_limit=3,
