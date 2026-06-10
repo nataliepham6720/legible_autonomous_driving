@@ -457,10 +457,14 @@ class TrainerWithGeneration(transformers.Seq2SeqTrainer):
         device = next(model.parameters()).device
         obs = inputs.get("observation", inputs)
 
-        route = self._to_device(obs["route_descriptors"],      device)
-        veh   = self._to_device(obs["vehicle_descriptors"],    device)
-        ped   = self._to_device(obs["pedestrian_descriptors"], device)
-        ego   = self._to_device(obs["ego_vehicle_descriptor"], device)
+        # route = self._to_device(obs["route_descriptors"],      device)
+        # veh   = self._to_device(obs["vehicle_descriptors"],    device)
+        # ped   = self._to_device(obs["pedestrian_descriptors"], device)
+        # ego   = self._to_device(obs["ego_vehicle_descriptor"], device)
+        route = torch.nan_to_num(self._to_device(obs["route_descriptors"],      device), nan=0.0)
+        veh   = torch.nan_to_num(self._to_device(obs["vehicle_descriptors"],    device), nan=0.0)
+        ped   = torch.nan_to_num(self._to_device(obs["pedestrian_descriptors"], device), nan=0.0)
+        ego   = torch.nan_to_num(self._to_device(obs["ego_vehicle_descriptor"], device), nan=0.0)
 
         outputs = model(
             input_ids=inputs["input_ids"],
@@ -602,6 +606,7 @@ def train(
         learning_rate=learning_rate,
         fp16=True,
         logging_steps=10,
+        max_grad_norm=1.0,
         evaluation_strategy="steps",
         eval_steps=eval_steps,
         save_steps=100,
