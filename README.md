@@ -46,10 +46,10 @@ While the training and evaluation datasets already include pre-collected Driving
     Run the following command:
 
     ```sh
-    python train_legible.py
+    python train_legible.py 
     ```
 
-2. **Evaluate for DrivingQA**
+2. **Evaluate for DrivingQA using legible-aware model**
 
     Run the following command:
 
